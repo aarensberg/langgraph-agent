@@ -69,7 +69,7 @@ graph TD;
 | `agent` | calls the Groq LLM (tools bound); it either answers or requests tool calls; increments `iterations` |
 | `approval` | **human-in-the-loop gate**: `interrupt`s before any Gmail tool runs, surfaces the pending email action, and records the student's decision in `approved` |
 | `tools` | runs every requested tool (supports parallel calls), with per-call error handling and de-duplication; **skips** a sensitive tool unless `approved == "approve"` |
-| `fallback` | safe exit that returns a graceful message when the loop budget is exhausted |
+| `fallback` | safe exit when the loop budget is exhausted: it answers each still-pending tool call with a `ToolMessage`, then returns a graceful message — leaving a valid conversation the next turn can build on |
 
 **The conditional edge** `route_after_agent` is the one real decision point, and it routes **four different ways** depending on the State (checked in priority order):
 
@@ -194,7 +194,7 @@ Voici les cours que vous suivez ce semestre :
 **2 — Grades + attendance, two tools in one turn.** *"Donne-moi ma moyenne générale et mon taux de présence global."* → `get_grades_summary` and `get_attendance_summary` → composed answer:
 
 ```
-Moyenne générale : 79,5 / 100 (équivalent : 15,9 / 20).
+Moyenne générale : 78,8 / 100 (équivalent : 15,8 / 20).
 Taux de présence global : 97 % (159 présences sur 164 séances).
 ```
 
