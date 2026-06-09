@@ -1,11 +1,11 @@
 """The tools the agent is allowed to call.
 
-Nine tools, each with a single responsibility and its own error handling. The
+Twelve tools, each with a single responsibility and its own error handling. The
 four Albert-API tools do all the data wrangling in Python (via
 :mod:`aggregations`) and hand the model clean, already-computed text — the LLM
 never sees raw JSON and is never asked to do arithmetic. The RAG tool answers
-from the official PDFs, the calculator covers hypotheticals, and three
-read-only Google tools bring in the student's mail and schedule.
+from the official PDFs, the calculator covers hypotheticals, and six Google tools
+bring in the student's mail and schedule — three that read, three that write.
 
 Tool boundaries (what each one owns):
     list_my_program         -> identity + this semester's course list
@@ -14,17 +14,21 @@ Tool boundaries (what each one owns):
     get_grades_summary      -> averages (overall / by teaching unit / by course)
     search_school_documents -> the enrollment certificate & historical transcripts
     calculator              -> safe arithmetic on numbers the user/agent supplies
-    search_emails           -> recent/matching Gmail messages (sensitive)
-    read_email              -> the full body of one email (sensitive)
-    get_calendar_events     -> Google Calendar events in a time window
+    search_emails           -> recent/matching Gmail messages (read)
+    read_email              -> the full body of one email (read)
+    get_calendar_events     -> Google Calendar events in a time window (read)
+    draft_email             -> save an email draft, never sent (write, ungated)
+    send_email              -> send an email (write, sensitive)
+    create_calendar_event   -> create a calendar event (write, sensitive)
 
 Every tool returns a string. On failure it returns a message starting with
 "⚠️" rather than raising, so the agent can tell the user something useful and
 carry on instead of crashing the graph.
 
-The two Gmail tools are listed in :data:`SENSITIVE_TOOLS`: reading the inbox is
-private, so the graph pauses for the student's approval before they run (see
-``human_approval`` in :mod:`albert_agent.graph`).
+:data:`SENSITIVE_TOOLS` lists the two outward-facing WRITES — ``send_email`` and
+``create_calendar_event`` — because they change things in the real world: the
+graph pauses for the student's approval before they run (see ``human_approval``
+in :mod:`albert_agent.graph`). Reads and drafting an email are never gated.
 """
 
 from __future__ import annotations
@@ -396,7 +400,7 @@ def calculator(expression: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Tool 7 — Gmail search (SENSITIVE: gated by human approval)
+# Tool 7 — Gmail search (read; ungated)
 # --------------------------------------------------------------------------- #
 @tool
 def search_emails(query: str = "", max_results: int = 5) -> str:
@@ -408,7 +412,6 @@ def search_emails(query: str = "", max_results: int = 5) -> str:
     and can be combined (e.g. ``from:dupont subject:exam newer_than:14d``). Leave
     it empty for the most recent messages. Returns each message's sender, subject,
     date, a snippet, and an id you can pass to ``read_email`` for the full text.
-    Reading email is private, so the student is asked to approve before this runs.
     """
     try:
         with log_tool_call("search_emails", {"query": query, "max_results": max_results}):
@@ -431,7 +434,7 @@ def search_emails(query: str = "", max_results: int = 5) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Tool 8 — read one email in full (SENSITIVE: gated by human approval)
+# Tool 8 — read one email in full (read; ungated)
 # --------------------------------------------------------------------------- #
 @tool
 def read_email(message_id: str) -> str:
@@ -440,8 +443,7 @@ def read_email(message_id: str) -> str:
     Use when a snippet is not enough and the student wants the actual contents of
     a specific message ("what exactly does that email say?"). ``message_id`` must
     be an id returned by ``search_emails``. Returns the sender, recipient, subject,
-    date and the full (plain-text) body. Like ``search_emails`` this is private
-    and asks for the student's approval first.
+    date and the full (plain-text) body.
     """
     try:
         with log_tool_call("read_email", {"message_id": message_id}):
@@ -457,7 +459,7 @@ def read_email(message_id: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Tool 9 — Google Calendar lookup
+# Tool 9 — Google Calendar lookup (read; ungated)
 # --------------------------------------------------------------------------- #
 @tool
 def get_calendar_events(
@@ -493,6 +495,89 @@ def get_calendar_events(
         return f"⚠️ Unexpected error while reading your calendar: {exc}"
 
 
+# --------------------------------------------------------------------------- #
+# Tool 10 — draft an email (write; UNGATED — a draft is saved, never sent)
+# --------------------------------------------------------------------------- #
+@tool
+def draft_email(to: str, subject: str, body: str) -> str:
+    """Compose an email and save it as a Gmail DRAFT (it is NOT sent).
+
+    Use this to prepare a message for the student to review ("write an email to my
+    professor about my absence", "draft a reply"). The draft lands in their Drafts
+    folder and nothing leaves the mailbox, so this needs no approval. When the
+    student is happy and asks to send, use ``send_email`` (which does ask for
+    confirmation). ``to`` is the recipient address. Returns the draft's recipient
+    and subject.
+    """
+    try:
+        with log_tool_call("draft_email", {"to": to, "subject": subject}):
+            d = google_client.create_draft(to, subject, body)
+            return (f"Draft saved (not sent) — to: {d['to']}, subject: "
+                    f"\"{d['subject']}\". Ask me to send it when you're ready.")
+    except GoogleError as exc:
+        return f"⚠️ Could not create the draft: {exc}"
+    except Exception as exc:  # noqa: BLE001
+        return f"⚠️ Unexpected error while drafting the email: {exc}"
+
+
+# --------------------------------------------------------------------------- #
+# Tool 11 — send an email (SENSITIVE: gated by human approval)
+# --------------------------------------------------------------------------- #
+@tool
+def send_email(to: str, subject: str, body: str) -> str:
+    """SEND an email from the student's account (the app gets their approval).
+
+    Call this whenever the student asks to send a message ("email my professor
+    that I'll be absent", "send it") — do NOT ask for confirmation yourself first.
+    The graph automatically pauses and asks the student to approve before the email
+    is actually sent, so calling this tool is how you request that approval; if
+    they decline, do not retry. ``to`` is the recipient address. Returns a
+    confirmation once the email is sent.
+    """
+    try:
+        with log_tool_call("send_email", {"to": to, "subject": subject}):
+            m = google_client.send_message(to, subject, body)
+            return f"✅ Email sent to {m['to']} (subject \"{m['subject']}\")."
+    except GoogleError as exc:
+        return f"⚠️ Could not send the email: {exc}"
+    except Exception as exc:  # noqa: BLE001
+        return f"⚠️ Unexpected error while sending the email: {exc}"
+
+
+# --------------------------------------------------------------------------- #
+# Tool 12 — create a calendar event (SENSITIVE: gated by human approval)
+# --------------------------------------------------------------------------- #
+@tool
+def create_calendar_event(
+    summary: str,
+    start: str,
+    end: str | None = None,
+    description: str | None = None,
+    location: str | None = None,
+) -> str:
+    """Create an event in the student's Google Calendar (the app gets approval).
+
+    Call this whenever the student asks to add or schedule something ("add X to my
+    calendar", "schedule a revision session tomorrow 2-4pm") — do NOT ask for
+    confirmation yourself first. ``start``/``end`` are ISO dates ("2026-06-20") or
+    datetimes ("2026-06-20T14:00"); resolve relative dates from today's date in
+    your system prompt. If ``end`` is omitted the event lasts one hour (or one full
+    day for an all-day event). The graph automatically pauses for the student's
+    approval before the event is created. Returns the created event.
+    """
+    try:
+        with log_tool_call("create_calendar_event",
+                           {"summary": summary, "start": start, "end": end}):
+            e = google_client.create_event(summary, start, end, description, location)
+            link = f" ({e['link']})" if e.get("link") else ""
+            return (f"✅ Event created: \"{e['summary']}\", "
+                    f"{e['start']} → {e['end']}.{link}")
+    except GoogleError as exc:
+        return f"⚠️ Could not create the event: {exc}"
+    except Exception as exc:  # noqa: BLE001
+        return f"⚠️ Unexpected error while creating the event: {exc}"
+
+
 # The agent's full toolbox, in a stable order.
 TOOLS = [
     list_my_program,
@@ -504,9 +589,14 @@ TOOLS = [
     search_emails,
     read_email,
     get_calendar_events,
+    draft_email,
+    send_email,
+    create_calendar_event,
 ]
 
 # Tools whose execution the graph gates behind explicit human approval, because
-# they read the student's private mailbox. The conditional edge routes to the
-# ``human_approval`` node whenever the model requests one of these.
-SENSITIVE_TOOLS = {"search_emails", "read_email"}
+# they perform an outward-facing WRITE on the student's behalf — sending an email
+# or creating a calendar event. The conditional edge routes to the
+# ``human_approval`` node whenever the model requests one of these. Reads and
+# drafting an email (saved, never sent) are NOT gated.
+SENSITIVE_TOOLS = {"send_email", "create_calendar_event"}

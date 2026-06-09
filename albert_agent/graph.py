@@ -12,10 +12,11 @@ every part is visible and testable:
 ``route_after_agent`` is the one meaningful conditional edge and it routes four
 different ways: to the tools when the model asked for them and the loop budget
 is intact; through ``approval`` (a human-in-the-loop ``interrupt``) first when
-the request would read the private mailbox; to ``fallback`` when the loop budget
-is exhausted (the safety harness); or straight to END when the model produced a
-final answer. The per-turn loop counter lives in the state and is reset by
-``guard`` at the start of every turn.
+the request would perform an outward-facing write (send an email, create a
+calendar event); to ``fallback`` when the loop budget is exhausted (the safety
+harness); or straight to END when the model produced a final answer. The per-turn
+loop counter lives in the state and is reset by ``guard`` at the start of every
+turn.
 """
 
 from __future__ import annotations
@@ -44,8 +45,9 @@ SYSTEM_PROMPT = """\
 You are the Albert School student assistant. You help one signed-in student get \
 clear, accurate answers about their own studies: their program and current \
 courses, a course's assessment/topics/documents, their attendance, and their \
-grades. You can also read their Gmail inbox and their Google Calendar to help \
-with school logistics (deadlines, schedules, messages from teachers).
+grades. You also help with school logistics in their Gmail and Google Calendar: \
+read mail and events, draft and send email, and create calendar events \
+(deadlines, schedules, messages from teachers).
 
 Today's date is {today}. Use it to resolve relative dates ("this week", \
 "tomorrow", "next month", "in March") into concrete dates for the calendar and \
@@ -55,19 +57,24 @@ How to work:
 - Always ground answers in tool results. Never invent grades, rates, dates, \
 course names, emails, events or documents. If you don't have it, say so.
 - Use your tools to fetch program/course info, attendance rates, grade \
-averages, and the official PDF documents; read mail and calendar events for \
-logistics; use the calculator for any arithmetic.
+averages, and the official PDF documents; use mail and calendar for logistics; \
+use the calculator for any arithmetic.
 - Mind the two grade sources, they are different: the live API grades are on a \
 0-100 scale and reflect the current standing; the transcripts in the PDF \
 documents are the official historical record on the French /20 scale with \
 letter grades and ECTS. Do not mix them, and search the documents when the user \
 asks about a past year, a transcript, or their enrollment certificate.
-- Email and calendar: search the inbox with Gmail operators (from:, subject:, \
-is:unread, newer_than:7d) and open one message with its id when the snippet is \
-not enough. Reading email is private — the student may be asked to approve it \
-first; if they decline, acknowledge that and answer from what you do have. \
-Never use mail/calendar to answer a question about grades, attendance or the \
-syllabus — those have their own tools.
+- Reading email and calendar is free: search the inbox with Gmail operators \
+(from:, subject:, is:unread, newer_than:7d), open a message by its id, and list \
+calendar events. Never use mail or calendar to answer a question about grades, \
+attendance or the syllabus — those have their own tools.
+- Writing: you may DRAFT an email (draft_email) freely — it is saved, never \
+sent. When the student asks you to SEND an email or to ADD/CREATE a calendar \
+event, call the matching tool right away with the details — do NOT ask the \
+student for confirmation yourself, and do NOT just describe what you would do. \
+The app automatically pauses and asks the student to approve before the action \
+actually runs, so calling the tool IS how you request that approval. If the \
+student declines, acknowledge it and do not retry.
 - You may call several tools at once when a question needs more than one \
 (e.g. attendance and grades together), but do not call the same tool twice with \
 the same arguments.
@@ -196,11 +203,12 @@ def tools_node(state: AgentState) -> dict:
     strings on failure, and this extra guard catches anything that still slips
     through, so one bad tool call never takes down the graph.
 
-    Sensitive tools (the Gmail ones) only run when ``approved == "approve"``,
-    which the ``human_approval`` node sets. If the student declined, the call is
-    skipped with a polite ToolMessage so the model can still answer; non-sensitive
-    calls in the same turn (e.g. a calendar lookup) always run. ``approved`` is
-    cleared afterwards so each new email request is gated on its own.
+    Sensitive tools (the writes: send email, create event) only run when
+    ``approved == "approve"``, which the ``human_approval`` node sets. If the
+    student declined, the call is skipped with a polite ToolMessage so the model
+    can still answer; non-sensitive calls in the same turn (a read, a draft)
+    always run. ``approved`` is cleared afterwards so each new write is gated on
+    its own.
     """
     registry = {t.name: t for t in TOOLS}
     last = state["messages"][-1]
@@ -209,8 +217,8 @@ def tools_node(state: AgentState) -> dict:
     seen: dict[str, str] = {}  # cache identical (name, args) calls within a turn
     for call in last.tool_calls:
         if call["name"] in SENSITIVE_TOOLS and not approved:
-            content = ("⚠️ The student declined to share their email for this "
-                       "request. Do not retry; answer from what you already have.")
+            content = ("⚠️ The student did not approve this action, so it was "
+                       "not performed. Do not retry; let them know it was cancelled.")
             results.append(
                 ToolMessage(content=content, tool_call_id=call["id"], name=call["name"])
             )
@@ -272,11 +280,11 @@ def human_approval(state: AgentState) -> dict:
 
     Built with LangGraph's dynamic ``interrupt``. On the first pass it suspends
     the graph (the checkpointer persists the paused state) and surfaces the
-    pending email actions to the UI; when the UI resumes with
-    ``Command(resume="approve"|"deny")`` the node re-runs and ``interrupt``
-    returns that decision, which it writes to ``approved`` for the tools node to
-    honour. Only the Gmail tools are gated — calendar and Albert tools never
-    reach this node.
+    pending write actions — sending an email, creating a calendar event — to the
+    UI; when the UI resumes with ``Command(resume="approve"|"deny")`` the node
+    re-runs, ``interrupt`` returns that decision, and it is written to
+    ``approved`` for the tools node to honour. Only outward-facing writes are
+    gated — reads and drafting an email never reach this node.
     """
     last = state["messages"][-1]
     pending = [
@@ -284,7 +292,7 @@ def human_approval(state: AgentState) -> dict:
         for c in last.tool_calls if c["name"] in SENSITIVE_TOOLS
     ]
     log_event("approval", status="requested", tools=[p["tool"] for p in pending])
-    decision = interrupt({"action": "approve_email_access", "pending": pending})
+    decision = interrupt({"action": "approve_write_actions", "pending": pending})
     decision = "approve" if decision in ("approve", True, "yes") else "deny"
     log_event("approval", status=decision)
     return {"approved": decision}
@@ -298,8 +306,9 @@ def route_after_agent(state: AgentState) -> Literal["tools", "approval", "fallba
 
     Four ways out, checked in priority order: a final answer ends the turn;
     an exhausted loop budget diverts to the safety ``fallback``; a request that
-    touches the private mailbox (and the gate is on) goes through
-    ``human_approval`` first; everything else runs its tools directly.
+    performs an outward-facing write (send mail / create event, and the gate is
+    on) goes through ``human_approval`` first; everything else runs its tools
+    directly.
     """
     last = state["messages"][-1]
     if not getattr(last, "tool_calls", None):
@@ -308,10 +317,10 @@ def route_after_agent(state: AgentState) -> Literal["tools", "approval", "fallba
     if state.get("iterations", 0) >= config.MAX_TOOL_ITERATIONS:
         log_event("route", decision="fallback", iterations=state["iterations"])
         return "fallback"  # safety: too many tool loops this turn
-    gate_on = state.get("require_approval", config.REQUIRE_EMAIL_APPROVAL)
+    gate_on = state.get("require_approval", config.REQUIRE_WRITE_APPROVAL)
     if gate_on and any(c["name"] in SENSITIVE_TOOLS for c in last.tool_calls):
         log_event("route", decision="approval", iterations=state["iterations"])
-        return "approval"  # HITL: ask before reading the inbox
+        return "approval"  # HITL: ask before an outward-facing write
     log_event("route", decision="tools", iterations=state["iterations"])
     return "tools"  # run the requested tool(s), then loop back to the model
 

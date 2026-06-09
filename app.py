@@ -9,9 +9,10 @@ A chat interface anyone can use without reading the code. It demonstrates the
 - **Streaming**: each turn streams the agent's steps (which tool is being
   called, with what arguments; when a tool returns; when it pauses for consent)
   into a live trace panel.
-- **Human-in-the-loop**: before the agent reads the private Gmail inbox, the
-  graph interrupts and this UI asks the student to Allow or Deny; the decision is
-  resumed back into the graph. The gate is toggleable in the sidebar.
+- **Human-in-the-loop**: before the agent sends an email or creates a calendar
+  event, the graph interrupts and this UI asks the student to Allow or Deny; the
+  decision is resumed back into the graph. Reads and drafts are never gated. The
+  gate is toggleable in the sidebar.
 - **Safety / observability**: a recursion limit is passed on every run, and the
   same structured events shown here are written to ``albert_agent.log``.
 
@@ -68,7 +69,7 @@ run_config = {
 
 # The HITL gate is on by default; the sidebar toggle flips it per run.
 if "gate" not in st.session_state:
-    st.session_state.gate = config.REQUIRE_EMAIL_APPROVAL
+    st.session_state.gate = config.REQUIRE_WRITE_APPROVAL
 
 
 def history_from_checkpointer() -> list[tuple]:
@@ -134,7 +135,7 @@ def stream_turn(input_obj) -> tuple[str | None, list[str], dict | None]:
         for chunk in app.stream(input_obj, config=run_config, stream_mode="updates"):
             if "__interrupt__" in chunk:
                 interrupt_payload = chunk["__interrupt__"][0].value
-                line = "⏸️ Pausing for your approval to read your email"
+                line = "⏸️ Pausing for your approval before a write action"
                 trace.append(line)
                 st.write(line)
                 continue
@@ -154,8 +155,8 @@ def stream_turn(input_obj) -> tuple[str | None, list[str], dict | None]:
                         st.write("✍️ Composing the answer")
                 elif node == "approval":
                     decided = update.get("approved") if isinstance(update, dict) else None
-                    line = ("🔓 Email access approved" if decided == "approve"
-                            else "🚫 Email access denied")
+                    line = ("🔓 Action approved" if decided == "approve"
+                            else "🚫 Action denied")
                     trace.append(line)
                     st.write(line)
                 elif node == "tools":
@@ -206,8 +207,8 @@ def take_turn(input_obj, prior_trace: list[str] | None = None) -> None:
 st.title("🎓 Albert Student Assistant")
 st.caption(
     "Ask about your program, a course, your attendance, your grades — or your "
-    "school mail and calendar. LangGraph · Groq · live intranet API + RAG + "
-    "read-only Gmail/Calendar."
+    "school mail and calendar (read, draft, and — with your OK — send/schedule). "
+    "LangGraph · Groq · live intranet API + RAG + Gmail/Calendar."
 )
 
 for entry in st.session_state.history:
@@ -221,13 +222,14 @@ if st.session_state.get("pending"):
     payload = st.session_state.pending["payload"]
     with st.chat_message("assistant"):
         st.warning(
-            "The assistant needs your permission to read your **email** to answer "
-            "this. It will only **read** the messages below — nothing is sent or "
-            "changed."
+            "The assistant wants to do the following **on your behalf**. It goes "
+            "ahead only if you **Allow** it — nothing is sent or changed otherwise."
         )
+        labels = {"send_email": "✉️ Send an email",
+                  "create_calendar_event": "📅 Add a calendar event"}
         for item in payload.get("pending", []):
             args = {k: v for k, v in (item.get("args") or {}).items() if v not in (None, "")}
-            label = "Search the inbox" if item["tool"] == "search_emails" else "Open an email"
+            label = labels.get(item["tool"], item["tool"])
             st.markdown(f"- **{label}** {_fmt_args(args)}")
         col_allow, col_deny = st.columns(2)
         allow = col_allow.button("✅ Allow", use_container_width=True, type="primary")
@@ -269,15 +271,16 @@ with st.sidebar:
         st.session_state.pending = None
         st.rerun()
 
-    st.markdown("### Privacy")
+    st.markdown("### Approvals")
     st.session_state.gate = st.checkbox(
-        "Ask before reading my emails",
+        "Ask before sending mail or changing my calendar",
         value=st.session_state.gate,
-        help="When on, the agent pauses for your approval before any Gmail tool "
-             "runs (human-in-the-loop). Calendar and school data are never gated.",
+        help="When on, the agent pauses for your approval before it sends an email "
+             "or creates a calendar event (human-in-the-loop). Reading mail and "
+             "the calendar, and saving a draft, are never gated.",
     )
 
-    st.markdown("### Google account (read-only)")
+    st.markdown("### Google account")
     connected = google_client.is_connected()
     st.caption("🟢 Connected" if connected else "⚪ Not connected")
     if not connected:
@@ -301,11 +304,11 @@ with st.sidebar:
     st.markdown("### Try asking")
     for example in [
         "What classes am I taking this semester?",
-        "How is the generative AI course graded?",
         "What is my attendance rate, and where am I least consistent?",
         "What is my average score per teaching unit?",
         "Any email from my professor about the exam?",
-        "What's on my calendar this week?",
+        "Draft an email to my professor about my absence tomorrow.",
+        "Add a revision session to my calendar tomorrow 2–4pm.",
     ]:
         st.markdown(f"- {example}")
 

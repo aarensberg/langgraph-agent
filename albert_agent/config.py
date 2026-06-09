@@ -76,27 +76,34 @@ TEMPERATURE = 0.0          # deterministic: this is an information assistant
 MAX_TOKENS = 1024          # cap each LLM turn (part of the safety harness)
 
 # --------------------------------------------------------------------------- #
-# Google Workspace (Gmail + Calendar) — READ-ONLY by design
+# Google Workspace (Gmail + Calendar)
 # --------------------------------------------------------------------------- #
-# The agent only ever READS the student's mail and calendar; the scopes below are
-# the read-only variants, so even a compromised token cannot send mail or alter
-# events. Changing these requires deleting token.json and re-consenting.
+# The agent READS mail and calendar freely, and can also WRITE: draft & send an
+# email, and create a calendar event. The safety boundary is the human-in-the-loop
+# gate (every outward-facing write is approved by the student — see the graph),
+# not the scope. We still request the *narrowest* scopes that cover those actions:
+# read/search the inbox, manage drafts & send mail, and read/create events.
+# Adding a scope invalidates the cached token, forcing a one-time re-consent.
 GOOGLE_SCOPES = [
-    "https://www.googleapis.com/auth/gmail.readonly",
-    "https://www.googleapis.com/auth/calendar.readonly",
+    "https://www.googleapis.com/auth/gmail.readonly",   # read & search the inbox
+    "https://www.googleapis.com/auth/gmail.compose",    # create drafts & send mail
+    "https://www.googleapis.com/auth/calendar.events",  # read & create/edit events
 ]
 GMAIL_MAX_RESULTS = 5          # default number of emails a search returns
 GMAIL_BODY_MAX_CHARS = 4000    # truncate a single email's body fed to the model
 CALENDAR_MAX_RESULTS = 10      # default number of events a lookup returns
 CALENDAR_DEFAULT_DAYS_AHEAD = 7  # default window when the user gives no end date
+CALENDAR_DEFAULT_EVENT_HOURS = 1  # default duration when only a start time is given
 
 # --------------------------------------------------------------------------- #
 # Safety harness
 # --------------------------------------------------------------------------- #
-# Human-in-the-loop: reading the inbox is the one genuinely private action, so by
-# default the graph pauses (interrupt) for the student's approval before any
-# email tool runs. The UI exposes a toggle; the eval flips it per case.
-REQUIRE_EMAIL_APPROVAL = True
+# Human-in-the-loop: writing is the consequential, outward-facing action —
+# sending an email or creating a calendar event — so by default the graph pauses
+# (interrupt) for the student's approval before any WRITE tool runs. Reading mail
+# and the calendar, and drafting an email (saved, never sent), are never gated.
+# The UI exposes a toggle; the eval flips it per case.
+REQUIRE_WRITE_APPROVAL = True
 # Hard ceiling on agent<->tools loops within a single user turn. The graph's
 # conditional edge routes to the ``fallback`` node once this is exceeded, so a
 # model that keeps calling tools forever can never run away.
