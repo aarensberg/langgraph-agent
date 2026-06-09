@@ -87,7 +87,7 @@ def _system_prompt() -> SystemMessage:
 
 
 # --------------------------------------------------------------------------- #
-# State — only the two fields the graph reads and writes
+# State — only the fields the graph reads and writes
 # --------------------------------------------------------------------------- #
 class AgentState(TypedDict):
     messages: Annotated[list, add_messages]  # chat history + tool results (reducer)
@@ -235,10 +235,26 @@ def tools_node(state: AgentState) -> dict:
 
 
 def fallback(state: AgentState) -> dict:
-    """Safety exit when the tool-loop budget is exhausted."""
+    """Safety exit when the tool-loop budget is exhausted.
+
+    The agent's final turn asked for tool(s) we are deliberately NOT going to run.
+    We still answer each pending tool_call with a ToolMessage before the apology,
+    so the saved conversation stays valid: the Groq/OpenAI contract requires every
+    tool_call to be followed by a matching tool reply, and without these closers
+    the *next* turn in the thread would replay a dangling tool_call and 400.
+    """
     log_event("fallback", reason="max_iterations", limit=config.MAX_TOOL_ITERATIONS)
+    last = state["messages"][-1]
+    closers = [
+        ToolMessage(
+            content="⚠️ Skipped: reached the step limit for this question.",
+            tool_call_id=call["id"],
+            name=call["name"],
+        )
+        for call in getattr(last, "tool_calls", None) or []
+    ]
     return {
-        "messages": [
+        "messages": closers + [
             AIMessage(
                 content=(
                     "I reached my internal step limit for this question and "
@@ -275,7 +291,7 @@ def human_approval(state: AgentState) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# The conditional edge — routes three ways
+# The conditional edge — routes four ways
 # --------------------------------------------------------------------------- #
 def route_after_agent(state: AgentState) -> Literal["tools", "approval", "fallback", "end"]:
     """Decide what happens after the model spoke, based on the State.

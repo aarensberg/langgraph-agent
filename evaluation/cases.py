@@ -46,14 +46,30 @@ def _ground_truth() -> dict:
     return {
         "attendance_rate": int(round(attendance["rate"])),       # e.g. 97
         "worst_course_kw": worst["course"].strip().split()[-1],  # e.g. "calculus"
-        "overall_int": int(round(grades["overall"])),            # e.g. 79
+        "overall_100": float(grades["overall"]),                 # e.g. 78.8 (/100)
     }
+
+
+def _grade_pattern(overall_100: float) -> str:
+    """A lenient regex matching the overall average however the model phrases it.
+
+    The grades tool relays the figure on BOTH scales, e.g. "78.8/100 (15.8/20)".
+    A faithful answer may quote either scale, round it, swap "." for "," or write
+    "/ 20" with spaces — so we accept the integer part of either scale (±1 for
+    rounding) or an explicit "/100"/"/20" marker (spaces allowed). This keeps the
+    check anchored on the right magnitude without penalising a correct phrasing.
+    """
+    o100 = int(overall_100)               # 78  (leading int of 78.8)
+    o20 = overall_100 / 5                  # 15.76  (the same grade on the /20 scale)
+    bands = sorted({o100, o100 + 1, int(o20), int(o20) + 1})  # {78, 79, 15, 16}
+    numbers = "|".join(str(n) for n in bands)
+    return rf"\b(?:{numbers})\b|/\s*20|/\s*100"
 
 
 def build_cases() -> list[Case]:
     gt = _ground_truth()
     rate = str(gt["attendance_rate"])
-    overall = str(gt["overall_int"])
+    grade_pat = _grade_pattern(gt["overall_100"])
 
     return [
         Case(
@@ -111,7 +127,7 @@ def build_cases() -> list[Case]:
             question="Quelle est ma moyenne générale actuelle ?",
             expect_route="tools",
             expect_tools={"get_grades_summary"},
-            must_include=[rf"{overall}|/20|/100"],
+            must_include=[grade_pat],
             tags=["grades"],
         ),
         Case(
