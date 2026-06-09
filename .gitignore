@@ -4,3 +4,10 @@ __pycache__/
 
 .env
 credentials.json
+
+instructions.md
+examples-for-final-project/
+inside-albert/
+
+.claude/
+CLAUDE.md
