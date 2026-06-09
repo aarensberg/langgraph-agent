@@ -1,0 +1,153 @@
+"""Test cases and success criteria for the agent.
+
+Each case asserts three independent things, so a failure points at *where* the
+agent broke:
+
+- **route**     : which way the conditional edge sent the turn
+                  ("tools", "end", or "fallback").
+- **tools**     : the tool(s) that must have been called (subset check) — this
+                  is the routing-correctness signal.
+- **content**   : regex patterns the final answer must contain — this is the
+                  end-to-end faithfulness signal (did the LLM relay the numbers
+                  the deterministic layer computed?).
+
+The numeric expectations (attendance rate, weakest course, overall average) are
+computed from the aggregation layer at run time, so the suite stays correct as
+the live data changes instead of hard-coding today's values.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+from albert_agent import aggregations as agg
+from albert_agent import api_client
+
+
+@dataclass
+class Case:
+    id: str
+    question: str
+    expect_route: str            # "tools" | "end" | "fallback"
+    expect_tools: set[str]       # tools that must appear in the trajectory
+    must_include: list[str]      # regex patterns (case-insensitive) the answer must match
+    max_iter_override: int | None = None  # force the safety branch when set
+    note: str = ""
+    tags: list[str] = field(default_factory=list)
+
+
+def _ground_truth() -> dict:
+    """Compute reference numbers straight from the deterministic tools layer."""
+    attendance = agg.attendance_summary(api_client.fetch_attendance())
+    worst = min(attendance["by_course"], key=lambda b: b["rate"])
+    grades = agg.grades_summary(api_client.fetch_grades(), api_client.fetch_courses())
+    return {
+        "attendance_rate": int(round(attendance["rate"])),       # e.g. 97
+        "worst_course_kw": worst["course"].strip().split()[-1],  # e.g. "calculus"
+        "overall_int": int(round(grades["overall"])),            # e.g. 79
+    }
+
+
+def build_cases() -> list[Case]:
+    gt = _ground_truth()
+    rate = str(gt["attendance_rate"])
+    overall = str(gt["overall_int"])
+
+    return [
+        Case(
+            id="greeting",
+            question="Bonjour ! Qu'est-ce que tu peux faire pour moi ?",
+            expect_route="end",
+            expect_tools=set(),
+            must_include=[r"cours|notes?|présence|programme"],
+            note="Small talk must NOT trigger a tool — exercises the 'end' branch.",
+            tags=["routing"],
+        ),
+        Case(
+            id="courses_semester",
+            question="Quels cours est-ce que je suis ce semestre ?",
+            expect_route="tools",
+            expect_tools={"list_my_program"},
+            must_include=[r"generative AI|Deep Learning|stochastic"],
+            tags=["program"],
+        ),
+        Case(
+            id="course_assessment",
+            question="Quelles sont les modalités d'évaluation du cours d'IA générative ?",
+            expect_route="tools",
+            expect_tools={"get_course_details"},
+            must_include=[r"30", r"project|projet|PROJ|oral"],
+            tags=["course"],
+        ),
+        Case(
+            id="course_documents",
+            question="Quels documents sont disponibles pour le cours d'introduction à l'IA générative ?",
+            expect_route="tools",
+            expect_tools={"get_course_details"},
+            must_include=[r"RAG|slides|lecture|\.pdf|notes"],
+            tags=["course"],
+        ),
+        Case(
+            id="attendance_overall",
+            question="Quel est mon taux de présence global ce semestre ?",
+            expect_route="tools",
+            expect_tools={"get_attendance_summary"},
+            must_include=[rf"{rate}\s*%|{rate}[.,]"],
+            note="Answer must relay the rate computed by the aggregation layer.",
+            tags=["attendance"],
+        ),
+        Case(
+            id="attendance_worst",
+            question="Dans quel cours suis-je le moins assidu ?",
+            expect_route="tools",
+            expect_tools={"get_attendance_summary"},
+            must_include=[gt["worst_course_kw"]],
+            tags=["attendance"],
+        ),
+        Case(
+            id="grades_overall",
+            question="Quelle est ma moyenne générale actuelle ?",
+            expect_route="tools",
+            expect_tools={"get_grades_summary"},
+            must_include=[rf"{overall}|/20|/100"],
+            tags=["grades"],
+        ),
+        Case(
+            id="grades_by_unit",
+            question="Donne-moi ma moyenne par Teaching Unit.",
+            expect_route="tools",
+            expect_tools={"get_grades_summary"},
+            must_include=[r"Data", r"Business", r"Math"],
+            tags=["grades"],
+        ),
+        Case(
+            id="transcript_rag",
+            question="D'après mon relevé de notes officiel, quelles unités d'enseignement ai-je validées en 2ème année ?",
+            expect_route="tools",
+            expect_tools={"search_school_documents"},
+            must_include=[r"/20|PASS|MATHEMATICS|DATA|BUSINESS|HUMANITIES"],
+            note="Must reach for the PDF transcripts (RAG), not the live /100 API.",
+            tags=["rag"],
+        ),
+        Case(
+            id="calculator_hypothetical",
+            question=("Le cours d'IA générative est noté 30% CC, 30% TP, 40% projet. "
+                      "Si j'obtiens 70 au CC, 75 au TP et 85 au projet, quelle est ma note finale ?"),
+            expect_route="tools",
+            expect_tools={"calculator"},
+            must_include=[r"77[.,]5|77\.5|77,5"],  # 0.3*70 + 0.3*75 + 0.4*85 = 77.5
+            note="A hypothetical the data tools can't answer — needs the calculator.",
+            tags=["calculator"],
+        ),
+        Case(
+            id="safety_fallback",
+            question="Fais-moi un bilan complet: programme, présence, notes et documents.",
+            expect_route="fallback",
+            expect_tools=set(),
+            must_include=[r"limit|narrow|rephrase"],
+            max_iter_override=1,  # force the budget to bite on the first tool request
+            note="With the loop budget set to 1, the conditional edge must divert "
+                 "to the fallback node — proves the safety branch is live, not dead code.",
+            tags=["routing", "safety"],
+        ),
+    ]

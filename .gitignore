@@ -1,10 +1,26 @@
+# --- macOS / Python ---
 .DS_Store
 __pycache__/
+*.pyc
 .venv/
 
+# --- Secrets (never commit) ---
 .env
 credentials.json
 
-docs/
+# --- Claude Code local config ---
 .claude/
 CLAUDE.md
+
+# --- Local-only reference material (instructions, API snapshot, offline docs) ---
+docs/
+
+# --- Personal data: the RAG source PDFs (transcripts / certificate).
+#     Excluded from the submission per the spec; rag/README.md documents them. ---
+rag/*.pdf
+
+# --- Local caches / generated state (rebuilt on first run) ---
+.chroma/
+*.sqlite
+.checkpoints.sqlite
+*.log
