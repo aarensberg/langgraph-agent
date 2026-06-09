@@ -20,7 +20,7 @@ import uuid
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
-from albert_agent import config
+from albert_agent import config, google_client
 from albert_agent.graph import get_agent
 from evaluation.cases import Case, build_cases
 
@@ -38,26 +38,34 @@ def run_case(app, case: Case) -> dict:
     }
     tools_called: list[str] = []
     nodes_seen: set[str] = set()
+    interrupted = False
     error = None
     try:
         for chunk in app.stream(
-            {"messages": [HumanMessage(content=case.question)]},
+            {"messages": [HumanMessage(content=case.question)],
+             "require_approval": case.require_approval},
             config=run_config,
             stream_mode="updates",
         ):
+            if "__interrupt__" in chunk:  # graph paused at the HITL gate
+                interrupted = True
+                continue
             for node, update in chunk.items():
                 nodes_seen.add(node)
                 if node == "agent":
                     msgs = update.get("messages", []) if isinstance(update, dict) else []
                     if msgs:
                         tools_called += [c["name"] for c in getattr(msgs[-1], "tool_calls", [])]
-        answer = app.get_state(run_config).values["messages"][-1].content
+        # When paused for approval there is no final answer yet — that IS the result.
+        answer = "" if interrupted else app.get_state(run_config).values["messages"][-1].content
     except Exception as exc:  # noqa: BLE001
         error, answer = str(exc), ""
     finally:
         config.MAX_TOOL_ITERATIONS = original_budget
 
-    route = "fallback" if "fallback" in nodes_seen else "tools" if "tools" in nodes_seen else "end"
+    route = ("approval" if interrupted
+             else "fallback" if "fallback" in nodes_seen
+             else "tools" if "tools" in nodes_seen else "end")
 
     route_ok = route == case.expect_route
     tools_ok = case.expect_tools.issubset(set(tools_called))
@@ -92,11 +100,18 @@ def main() -> None:
         cases = [c for c in cases if args.tag in c.tags]
 
     app = get_agent(checkpointer=InMemorySaver())  # isolated, no on-disk state
+    google_ok = google_client.is_connected()
     print(f"Model: {config.MODEL_NAME} | fallback chain: {', '.join(config.FALLBACK_MODELS)}")
+    print(f"Google connected: {google_ok}")
     print(f"Running {len(cases)} cases\n" + "=" * 72)
 
     results = []
+    skipped = 0
     for case in cases:
+        if case.needs_google and not google_ok:
+            skipped += 1
+            print(f"[SKIP] {case.id:<22} (needs a connected Google account)")
+            continue
         res = run_case(app, case)
         results.append(res)
         status = "PASS" if res["passed"] else "FAIL"
@@ -108,7 +123,9 @@ def main() -> None:
     passed = sum(r["passed"] for r in results)
     total = len(results)
     print("=" * 72)
-    print(f"SUCCESS RATE: {passed}/{total} = {100 * passed / total:.0f}%")
+    rate = f"{100 * passed / total:.0f}%" if total else "n/a"
+    print(f"SUCCESS RATE: {passed}/{total} = {rate}"
+          + (f"  ({skipped} skipped: Google not connected)" if skipped else ""))
 
     failed = [r for r in results if not r["passed"]]
     if failed:

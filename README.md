@@ -1,15 +1,8 @@
 # Albert School — Student Assistant Agent
 
-A LangGraph agent that answers an Albert School student's natural-language
-questions about **their own studies**: their program and current courses, a
-course's assessment/topics/documents, their attendance, and their grades. It
-combines the **live Albert intranet API** and a **RAG retriever** over the
-student's official PDF documents as tools, runs on **Groq**, and is used through
-a **Streamlit** chat UI.
+A LangGraph agent that answers an Albert School student's natural-language questions about **their own studies**: their program and current courses, a course's assessment/topics/documents, their attendance, and their grades — and, in V2, the school logistics that live in their **Gmail** and **Google Calendar** (deadlines, schedules, messages from teachers). It combines the **live Albert intranet API**, a **RAG retriever** over the student's official PDF documents, and **read-only Google Workspace** access as tools, runs on **Groq**, and is used through a **Streamlit** chat UI. Reading the private inbox is gated behind a **human-in-the-loop** approval step.
 
-> Built for the "Introduction to generative AI" final project. It targets both
-> the mandatory bar *and* several "Going further" extensions (see
-> [Extensions](#going-further-extensions)).
+> Built for the "Introduction to generative AI" final project. It targets both the mandatory bar *and* several "Going further" extensions (see [Extensions](#going-further-extensions)).
 
 ---
 
@@ -23,6 +16,9 @@ A student can ask, in French or English and in any order:
 - *"What is my average grade per teaching unit?"*
 - *"According to my official transcript, what courses did I complete in my first year?"*
 - *"If I get a 70 on the written exam, a 75 on the practical exam, and an 85 on the project, what is my final grade?"*
+- *"Any email from my professor about the exam this week?"*
+- *"List the emails in my inbox and summarize the content of each one in a single sentence."*
+- *"What's on my calendar tomorrow?"*
 
 These questions don't map to one fixed pipeline: each needs a **different tool
 (or combination of tools)**, the right **identifiers**, and sometimes a
@@ -48,14 +44,17 @@ graph TD;
 	__start__([start]):::first
 	guard(guard)
 	agent(agent)
+	approval(approval)
 	tools(tools)
 	fallback(fallback)
 	__end__([end]):::last
 	__start__ --> guard;
 	guard --> agent;
 	agent -. "end" .-> __end__;
-	agent -.-> tools;
-	agent -.-> fallback;
+	agent -. "tools" .-> tools;
+	agent -. "approval (reads mail)" .-> approval;
+	agent -. "fallback" .-> fallback;
+	approval --> tools;
 	tools --> agent;
 	fallback --> __end__;
 	classDef first fill-opacity:0
@@ -68,48 +67,64 @@ graph TD;
 |---|---|---|
 | `messages` | `Annotated[list, add_messages]` | chat history + tool results, accumulated via the `add_messages` reducer |
 | `iterations` | `int` | tool-loop counter for the current turn (safety harness) |
+| `require_approval` | `bool` | whether the HITL email gate is on (set by the UI per run) |
+| `approved` | `str \| None` | the student's decision (`"approve"`/`"deny"`) for a pending email read |
 
 **Nodes** (each is `State -> partial State`):
 
 | Node | Job |
 |---|---|
-| `guard` | entry point; resets `iterations` to 0 at the start of every user turn (the checkpointer persists it across turns, so it must be reset) |
+| `guard` | entry point; resets `iterations` to 0 and clears `approved` at the start of every user turn (the checkpointer persists them across turns, so they must be reset) |
 | `agent` | calls the Groq LLM (tools bound); it either answers or requests tool calls; increments `iterations` |
-| `tools` | runs every requested tool (supports parallel calls), with per-call error handling and de-duplication of identical calls |
+| `approval` | **human-in-the-loop gate**: `interrupt`s before any Gmail tool runs, surfaces the pending email action, and records the student's decision in `approved` |
+| `tools` | runs every requested tool (supports parallel calls), with per-call error handling and de-duplication; **skips** a sensitive tool unless `approved == "approve"` |
 | `fallback` | safe exit that returns a graceful message when the loop budget is exhausted |
 
 **The conditional edge** `route_after_agent` is the one real decision point, and
-it routes **three different ways** depending on the State:
+it routes **four different ways** depending on the State (checked in priority
+order):
 
-- **→ `tools`** — the model asked for tool(s) and the loop budget is intact;
 - **→ `end`** — the model produced a final answer (no tool calls);
-- **→ `fallback`** — the loop budget is exhausted (safety).
+- **→ `fallback`** — the loop budget is exhausted (safety);
+- **→ `approval`** — the request would read the private mailbox and the gate is on (HITL);
+- **→ `tools`** — the model asked for tool(s) and none of the above applies.
 
 Each branch is exercised by the evaluation suite (a greeting routes to `end`, a
-data question routes through `tools`, and a budget-capped case routes to
-`fallback`), so no branch is dead code.
+data question routes through `tools`, an email question routes to `approval`, and
+a budget-capped case routes to `fallback`), so no branch is dead code.
 
 ### System prompt
 
 The prompt is part of the design. The `agent` node prepends this (it is not
-stored in the state, to avoid duplication):
+stored in the state, to avoid duplication), with **today's date injected** each
+turn so the agent can resolve relative dates ("this week", "tomorrow") for the
+calendar and attendance tools:
 
 ```
 You are the Albert School student assistant. You help one signed-in student get
 clear, accurate answers about their own studies: their program and current
 courses, a course's assessment/topics/documents, their attendance, and their
-grades.
+grades. You can also read their Gmail inbox and their Google Calendar to help
+with school logistics (deadlines, schedules, messages from teachers).
+
+Today's date is {today}. Use it to resolve relative dates ("this week",
+"tomorrow", "next month", "in March") into concrete dates for the calendar and
+attendance tools.
 
 How to work:
 - Always ground answers in tool results. Never invent grades, rates, dates,
-  course names or documents. If you don't have it, say so.
+  course names, emails, events or documents. If you don't have it, say so.
 - Use your tools to fetch program/course info, attendance rates, grade averages,
-  and the official PDF documents; use the calculator for any arithmetic.
-- Mind the two grade sources, they are different: the live API grades are on a
-  0-100 scale and reflect the current standing; the transcripts in the PDF
-  documents are the official historical record on the French /20 scale with
-  letter grades and ECTS. Do not mix them, and search the documents when the
-  user asks about a past year, a transcript, or their enrollment certificate.
+  and the official PDF documents; read mail and calendar events for logistics;
+  use the calculator for any arithmetic.
+- Mind the two grade sources, they are different: [/100 live API vs /20 PDF
+  transcripts — search the documents for a past year, a transcript, a certificate].
+- Email and calendar: search the inbox with Gmail operators (from:, subject:,
+  is:unread, newer_than:7d) and open one message with its id when the snippet is
+  not enough. Reading email is private — the student may be asked to approve it
+  first; if they decline, acknowledge that and answer from what you do have.
+  Never use mail/calendar to answer a question about grades, attendance or the
+  syllabus — those have their own tools.
 - You may call several tools at once when a question needs more than one, but do
   not call the same tool twice with the same arguments.
 - After your tools return, write a complete, direct answer for the student using
@@ -123,9 +138,10 @@ How to work:
 
 ## Tools
 
-Six tools, each with one responsibility and its own error handling (a failure
+Nine tools, each with one responsibility and its own error handling (a failure
 returns a `⚠️ …` message instead of raising, so one bad call never breaks the
-graph).
+graph). The two 🔒 tools read the private inbox and are gated by the approval
+node.
 
 | Tool | Responsibility | Source |
 |---|---|---|
@@ -135,13 +151,23 @@ graph).
 | `get_grades_summary` | averages (overall / by teaching unit / by course) | API: grades → pandas |
 | `search_school_documents` | the enrollment certificate + historical transcripts | RAG: Chroma + FastEmbed |
 | `calculator` | safe arithmetic for hypotheticals / cross-source math | local AST evaluator |
+| `search_emails` 🔒 | recent / matching Gmail messages (Gmail query syntax) | Gmail API (read-only) |
+| `read_email` 🔒 | the full body of one email by id | Gmail API (read-only) |
+| `get_calendar_events` | events in a date window (defaults to next 7 days) | Calendar API (read-only) |
+
+**Tool boundaries within Google.** `search_emails` lists matches (sender,
+subject, date, snippet, id); `read_email` opens *one* message in full by the id
+that search returned — a deliberate two-step so the agent (and the approval
+prompt) is specific about what it reads. The Google scopes are the **read-only**
+variants, so the agent physically cannot send mail or edit the calendar.
 
 **Tools deliberately *not* included.** *Web search* — every question is about the
-student's own intranet data; the web adds noise and a chance to answer
-off-topic, so it is excluded on purpose. *Database query* — there is no database;
-the structured source is the API. *File reader* — reading the PDFs is part of
-building the RAG index (`PyPDFLoader`), not a separate runtime tool. This is a
-considered tool selection, not the full suggested list.
+student's own school data; the web adds noise and a chance to answer off-topic,
+so it is excluded on purpose. *Sending mail / writing events* — out of scope by
+design (read-only), which also removes the riskiest failure mode. *Database
+query* / *file reader* — there is no database, and reading the PDFs is part of
+building the RAG index, not a separate runtime tool. This is a considered tool
+selection, not the full suggested list.
 
 ---
 
@@ -161,6 +187,19 @@ considered tool selection, not the full suggested list.
 - **Local embeddings.** Groq has no embeddings endpoint, so the RAG tool uses
   `FastEmbedEmbeddings` (ONNX, no API key, reuses the `onnxruntime` Chroma already
   pulls in) — avoiding the heavy `torch`/`sentence-transformers` path.
+- **Read-only Google, cached OAuth.** The Gmail/Calendar tools request only the
+  `*.readonly` scopes, so the agent cannot send mail or alter the calendar by
+  construction. The first consent runs the installed-app OAuth flow once and
+  caches a refresh token in `token.json` (gitignored); afterwards it refreshes
+  silently, and the tools degrade to a clear "not connected" message rather than
+  ever opening a browser mid-conversation.
+- **Gate only what's private.** The approval interrupt fires for the *Gmail*
+  tools only — calendar and Albert data are not gated — so the friction lands
+  exactly where the privacy cost is, not on every question (see Extensions).
+- **Today's date in the prompt.** The system prompt is rebuilt each turn with the
+  current date injected, so the model can turn "this week" / "tomorrow" into the
+  concrete ISO dates the calendar tool needs (and reason about "this month" for
+  attendance).
 - **Caching for Streamlit.** The compiled graph and the Chroma store are built
   once behind `@st.cache_resource`; structural API data (profile, course list) is
   memoised; documents are embedded once and persisted to `.chroma/`.
@@ -178,32 +217,44 @@ considered tool selection, not the full suggested list.
 
 ## Going further (extensions)
 
-Five extensions, each chosen because it improves *this* assistant rather than to
+Six extensions, each chosen because it improves *this* assistant rather than to
 show off a feature:
 
-1. **Persistence** — a `SqliteSaver` checkpointer keyed by a `thread_id` carried
-   in the URL, so a page reload or server restart restores the conversation.
-   *Trade-off:* on-disk state must be cleared to truly start over (the "New
-   conversation" button issues a fresh id).
-2. **Streaming** — every turn streams the agent's steps (which tool, with what
-   arguments; when each returns) into a live trace panel, so the reasoning is
-   visible. *Trade-off:* `stream_mode="updates"` surfaces post-node updates, so
-   the trace is step-level, not token-level.
-3. **RAG as a tool** — the Unit-3 retrieval pipeline (`PyPDFLoader` →
+1. **Human-in-the-loop** — before any Gmail tool runs, the graph `interrupt`s at
+   the `approval` node and the UI asks the student to **Allow** or **Deny**; the
+   decision is resumed back into the graph with `Command(resume=…)`. Only the
+   inbox is gated (calendar and school data are not), so the friction lands
+   exactly where the privacy cost is. *Impact:* the agent can touch genuinely
+   private data without ever reading it behind the student's back. *Trade-off:* a
+   gated turn spans two interactions; the gate is toggleable in the sidebar for a
+   frictionless demo, and re-prompts per email request rather than once per
+   session (each access is consented on its own).
+2. **Persistence** — a `SqliteSaver` checkpointer keyed by a `thread_id` carried
+   in the URL, so a page reload or server restart restores the conversation —
+   *including a pending approval request*, which the UI rehydrates from the
+   checkpointer. *Trade-off:* on-disk state must be cleared to truly start over
+   (the "New conversation" button issues a fresh id).
+3. **Streaming** — every turn streams the agent's steps (which tool, with what
+   arguments; when each returns; when it pauses for consent) into a live trace
+   panel. *Trade-off:* `stream_mode="updates"` surfaces post-node updates, so the
+   trace is step-level, not token-level.
+4. **RAG as a tool** — the Unit-3 retrieval pipeline (`PyPDFLoader` →
    `RecursiveCharacterTextSplitter` → Chroma) is exposed as one tool, giving the
    agent a second, document-grounded source distinct from the live API.
-4. **Observability** — every node, routing decision and tool call (name, args,
-   outcome, latency) is written as a structured line to `albert_agent.log`;
-   LangSmith tracing turns on automatically if a key is present. *Trade-off:* the
-   always-on log is local; full prompt/token traces need LangSmith.
-5. **Safety harness** — a per-turn tool-loop budget enforced *in the conditional
+5. **Observability** — every node, routing decision, approval outcome and tool
+   call (name, args, outcome, latency) is written as a structured line to
+   `albert_agent.log`; LangSmith tracing turns on automatically if a key is
+   present. *Trade-off:* the always-on log is local; full prompt/token traces
+   need LangSmith.
+6. **Safety harness** — a per-turn tool-loop budget enforced *in the conditional
    edge* (→ `fallback`), a per-call `max_tokens` cap, a graph recursion limit,
-   per-tool error handling, and the model fallback chain above. The budget is
-   part of the graph, not a wrapper, which is why it is testable as a routed
-   branch.
+   per-tool error handling, the read-only Google scopes, and the model fallback
+   chain above. The budget is part of the graph, not a wrapper, which is why it
+   is testable as a routed branch.
 
-Human-in-the-loop and MCP were deliberately skipped: the assistant is read-only
-over the student's own data, so an approval gate would be gratuitous.
+MCP was deliberately skipped: the three data sources here (intranet API, RAG,
+Google) are reached directly and well, and adding an MCP server would be
+plumbing for its own sake rather than something this assistant needs.
 
 ---
 
@@ -222,25 +273,40 @@ checks three independent things, so a failure says *where* it broke:
 Run it with:
 
 ```bash
-python -m evaluation.run_eval           # all cases
-python -m evaluation.run_eval --tag rag # one category
+python -m evaluation.run_eval            # all cases
+python -m evaluation.run_eval --tag rag  # one category (rag / email / calendar / hitl / safety …)
 ```
 
-**Result: 11/11 cases pass (100%).** The 11 cases span all six tools and all
-three routes, including a budget-capped case that correctly diverts to
-`fallback`. The recommended `llama-3.3-70b-versatile` hit its Groq free-tier
-**daily token limit** during evaluation, so the suite was run on the comparably
-capable `openai/gpt-oss-120b`; while 70b was throttled, the automatic fallback
-chain was observed keeping the agent answering — the safety harness doing its
-job.
+**Result: 12/12 runnable cases pass (100%); 2 more run when a Google account is
+connected (14/14).** The suite spans all nine tools and all four routes. Notably:
+
+- `email_approval_gate` — an email question with the gate on must route to
+  `approval` and **interrupt before any Gmail call**. This proves the HITL branch
+  end-to-end *without* a connected account (the pause happens first), so it always
+  runs.
+- `email_search` / `calendar_week` — these actually execute the Google tools, so
+  they are **skipped with a clear `[SKIP]`** (not failed) when no account is
+  connected, and counted as passes once you connect one.
+- `safety_fallback` — with the loop budget forced to 1, the conditional edge
+  diverts to `fallback`, proving that branch is live.
+
+The recommended `llama-3.3-70b-versatile` hits its Groq free-tier **daily token
+limit** quickly, so the suite is run on the comparably capable
+`openai/gpt-oss-120b` (`ALBERT_AGENT_MODEL=openai/gpt-oss-120b`); the automatic
+fallback chain was observed keeping the agent answering while 70b was throttled —
+the safety harness doing its job.
 
 **Failure modes observed.** (1) The small `8b` fallback model sometimes emits a
 meta-comment instead of synthesising the tool results, or calls a tool twice —
 mitigated by the prompt and by de-duplicating identical tool calls in the `tools`
 node. (2) Content checks are intentionally lenient (keywords / rounded numbers)
-to avoid penalising correct answers that phrase a number differently. (3) The
-70b daily token limit is the main operational risk; the model fallback trades
-answer quality for availability rather than failing the turn.
+to avoid penalising correct answers that phrase a number differently; the
+Google cases assert routing + tool choice only, since live inbox/calendar
+content is non-deterministic. (3) A weaker model occasionally tries to answer a
+grades/attendance question from mail or calendar — countered by an explicit
+"never use mail/calendar for those" rule in the system prompt. (4) The 70b daily
+token limit is the main operational risk; the model fallback trades answer
+quality for availability rather than failing the turn.
 
 ---
 
@@ -277,6 +343,25 @@ Le cours « Introduction to generative AI » (DAT0621) est évalué ainsi :
 Note finale = 30 % CC + 30 % TP + 40 % PROJ.
 ```
 
+**4 — Email with human-in-the-loop (V2).** *"Did I receive an email from my
+teacher about the exam?"* → the model requests `search_emails(query="from:prof
+subject:exam")`; the conditional edge routes to `approval` and the graph
+**pauses**. The UI shows:
+
+```
+⚠️ The assistant needs your permission to read your email to answer this.
+   - Search the inbox (query='from:prof subject:exam')
+   [ ✅ Allow ]   [ 🚫 Deny ]
+```
+
+On **Allow**, the run resumes, `search_emails` executes, and the agent answers
+from the matches (e.g. *"Oui — un email de M. Dupont du 6 juin, objet « Examen
+final », qui annonce l'examen le 16 juin en salle B12."*). On **Deny**, the tool
+is skipped and the agent replies that it can't access the inbox and offers the
+calendar/school data instead. The routing-to-`approval` and the pause are
+covered by the `email_approval_gate` eval case; the answer text depends on the
+connected mailbox.
+
 ---
 
 ## How to run
@@ -292,30 +377,39 @@ uv pip install -r requirements.txt
 
 # 3. Put the 4 source PDFs in rag/ (see rag/README.md)
 
-# 4. Launch the UI
+# 4. (optional, for the Gmail/Calendar tools) put an OAuth 2.0 client id
+#    ("Desktop app", with the Gmail + Calendar APIs enabled) at credentials.json,
+#    then connect once — opens a browser for read-only consent, caches token.json:
+python -m albert_agent.google_auth          # --status to check, --logout to revoke
+
+# 5. Launch the UI  (you can also connect Google from the sidebar)
 streamlit run app.py
 
-# 5. (optional) Run the evaluation suite
+# 6. (optional) Run the evaluation suite
 python -m evaluation.run_eval
 ```
 
 On first launch the documents are embedded once (FastEmbed downloads a small
-ONNX model) and cached to `.chroma/`.
+ONNX model) and cached to `.chroma/`. The Google tools are optional: without a
+connected account everything else works, and those tools simply return a clear
+"not connected" message.
 
 ---
 
 ## Project structure
 
 ```
-app.py                      Streamlit chat UI (cached graph, streaming, persistence)
+app.py                      Streamlit chat UI (cached graph, streaming, persistence, approval)
 albert_agent/
   config.py                 env + tunable constants (single source of truth)
   observability.py          structured logging + optional LangSmith
   api_client.py             authenticated Albert API wrapper (the two-id trap handled here)
   aggregations.py           pandas: attendance rates, grade averages, term filter
   rag.py                    Chroma + FastEmbed retriever over the PDFs
-  tools.py                  the 6 LangChain tools
-  graph.py                  State, nodes, conditional edge, checkpointer, system prompt
+  google_client.py          read-only Gmail + Calendar client (OAuth, cached token)
+  google_auth.py            one-time `python -m albert_agent.google_auth` consent CLI
+  tools.py                  the 9 LangChain tools (2 sensitive: Gmail)
+  graph.py                  State, nodes, conditional edge, HITL gate, checkpointer, prompt
 evaluation/
   cases.py                  test cases + success criteria
   run_eval.py               runner: success rate + failure modes
@@ -323,5 +417,6 @@ rag/                        source PDFs (gitignored; see rag/README.md)
 requirements.txt            pinned versions
 ```
 
-The submission excludes secrets (`.env`), personal data (`rag/*.pdf`, `docs/`),
-and local caches (`.chroma/`, `*.sqlite`, `*.log`).
+The submission excludes secrets (`.env`, `credentials.json`, `token.json`),
+personal data (`rag/*.pdf`, `docs/`), and local caches (`.chroma/`, `*.sqlite`,
+`*.log`).

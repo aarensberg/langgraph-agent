@@ -28,10 +28,12 @@ from albert_agent import api_client
 class Case:
     id: str
     question: str
-    expect_route: str            # "tools" | "end" | "fallback"
+    expect_route: str            # "tools" | "end" | "fallback" | "approval"
     expect_tools: set[str]       # tools that must appear in the trajectory
     must_include: list[str]      # regex patterns (case-insensitive) the answer must match
     max_iter_override: int | None = None  # force the safety branch when set
+    require_approval: bool = True  # HITL gate state for this case
+    needs_google: bool = False   # skip when no Google account is connected
     note: str = ""
     tags: list[str] = field(default_factory=list)
 
@@ -138,6 +140,41 @@ def build_cases() -> list[Case]:
             must_include=[r"77[.,]5|77\.5|77,5"],  # 0.3*70 + 0.3*75 + 0.4*85 = 77.5
             note="A hypothetical the data tools can't answer — needs the calculator.",
             tags=["calculator"],
+        ),
+        Case(
+            id="email_approval_gate",
+            question="Ai-je reçu un email de mon professeur à propos de l'examen ?",
+            expect_route="approval",
+            expect_tools={"search_emails"},
+            must_include=[],
+            note="Reading mail is private: with the gate ON, the conditional edge "
+                 "must divert to the human_approval interrupt BEFORE any Gmail "
+                 "call runs — so this proves the HITL branch is live and needs no "
+                 "Google connection (the pause happens first).",
+            tags=["email", "hitl", "routing"],
+        ),
+        Case(
+            id="email_search",
+            question="Cherche mes emails non lus de cette semaine.",
+            expect_route="tools",
+            expect_tools={"search_emails"},
+            must_include=[],
+            require_approval=False,  # gate off -> the Gmail tool runs without pausing
+            needs_google=True,
+            note="Gate off: routes straight to the Gmail tool. Skipped when no "
+                 "Google account is connected.",
+            tags=["email", "google"],
+        ),
+        Case(
+            id="calendar_week",
+            question="Qu'est-ce que j'ai de prévu dans mon agenda cette semaine ?",
+            expect_route="tools",
+            expect_tools={"get_calendar_events"},
+            must_include=[],
+            needs_google=True,
+            note="Calendar is never gated; routes directly to the calendar tool. "
+                 "Skipped when no Google account is connected.",
+            tags=["calendar", "google"],
         ),
         Case(
             id="safety_fallback",

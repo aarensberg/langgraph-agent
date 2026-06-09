@@ -24,6 +24,14 @@ RAG_PDF_DIR = PROJECT_ROOT / "rag"                 # the 4 source PDFs
 CHROMA_DIR = PROJECT_ROOT / ".chroma"              # persisted vector store
 CHECKPOINT_DB = PROJECT_ROOT / ".checkpoints.sqlite"  # conversation persistence
 LOG_FILE = PROJECT_ROOT / "albert_agent.log"       # structured run log
+# Google OAuth: the downloaded client-id file, and the cached user token.
+# Both are secrets and are gitignored; token.json is minted on first consent.
+GOOGLE_CREDENTIALS_FILE = Path(
+    os.getenv("GOOGLE_CREDENTIALS_FILE", PROJECT_ROOT / "credentials.json")
+)
+GOOGLE_TOKEN_FILE = Path(
+    os.getenv("GOOGLE_TOKEN_FILE", PROJECT_ROOT / "token.json")
+)
 
 # --------------------------------------------------------------------------- #
 # Secrets (read lazily where used; may be ``None`` until validated)
@@ -68,8 +76,27 @@ TEMPERATURE = 0.0          # deterministic: this is an information assistant
 MAX_TOKENS = 1024          # cap each LLM turn (part of the safety harness)
 
 # --------------------------------------------------------------------------- #
+# Google Workspace (Gmail + Calendar) — READ-ONLY by design
+# --------------------------------------------------------------------------- #
+# The agent only ever READS the student's mail and calendar; the scopes below are
+# the read-only variants, so even a compromised token cannot send mail or alter
+# events. Changing these requires deleting token.json and re-consenting.
+GOOGLE_SCOPES = [
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/calendar.readonly",
+]
+GMAIL_MAX_RESULTS = 5          # default number of emails a search returns
+GMAIL_BODY_MAX_CHARS = 4000    # truncate a single email's body fed to the model
+CALENDAR_MAX_RESULTS = 10      # default number of events a lookup returns
+CALENDAR_DEFAULT_DAYS_AHEAD = 7  # default window when the user gives no end date
+
+# --------------------------------------------------------------------------- #
 # Safety harness
 # --------------------------------------------------------------------------- #
+# Human-in-the-loop: reading the inbox is the one genuinely private action, so by
+# default the graph pauses (interrupt) for the student's approval before any
+# email tool runs. The UI exposes a toggle; the eval flips it per case.
+REQUIRE_EMAIL_APPROVAL = True
 # Hard ceiling on agent<->tools loops within a single user turn. The graph's
 # conditional edge routes to the ``fallback`` node once this is exceeded, so a
 # model that keeps calling tools forever can never run away.

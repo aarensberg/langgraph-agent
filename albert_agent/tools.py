@@ -1,22 +1,30 @@
 """The tools the agent is allowed to call.
 
-Six tools, each with a single responsibility and its own error handling. The
-four API tools do all the data wrangling in Python (via :mod:`aggregations`) and
-hand the model clean, already-computed text — the LLM never sees raw JSON and is
-never asked to do arithmetic. The RAG tool answers from the official PDFs, and
-the calculator covers hypotheticals ("what do I need on the final to reach X").
+Nine tools, each with a single responsibility and its own error handling. The
+four Albert-API tools do all the data wrangling in Python (via
+:mod:`aggregations`) and hand the model clean, already-computed text — the LLM
+never sees raw JSON and is never asked to do arithmetic. The RAG tool answers
+from the official PDFs, the calculator covers hypotheticals, and three
+read-only Google tools bring in the student's mail and schedule.
 
 Tool boundaries (what each one owns):
-    list_my_program        -> identity + this semester's course list
-    get_course_details     -> one course: assessment, topics, documents
-    get_attendance_summary -> attendance rate (overall / by course / by month)
-    get_grades_summary     -> averages (overall / by teaching unit / by course)
-    search_school_documents-> the enrollment certificate & historical transcripts
-    calculator             -> safe arithmetic on numbers the user/agent supplies
+    list_my_program         -> identity + this semester's course list
+    get_course_details      -> one course: assessment, topics, documents
+    get_attendance_summary  -> attendance rate (overall / by course / by month)
+    get_grades_summary      -> averages (overall / by teaching unit / by course)
+    search_school_documents -> the enrollment certificate & historical transcripts
+    calculator              -> safe arithmetic on numbers the user/agent supplies
+    search_emails           -> recent/matching Gmail messages (sensitive)
+    read_email              -> the full body of one email (sensitive)
+    get_calendar_events     -> Google Calendar events in a time window
 
 Every tool returns a string. On failure it returns a message starting with
 "⚠️" rather than raising, so the agent can tell the user something useful and
 carry on instead of crashing the graph.
+
+The two Gmail tools are listed in :data:`SENSITIVE_TOOLS`: reading the inbox is
+private, so the graph pauses for the student's approval before they run (see
+``human_approval`` in :mod:`albert_agent.graph`).
 """
 
 from __future__ import annotations
@@ -28,8 +36,9 @@ from typing import Callable
 from langchain_core.tools import tool
 
 from . import aggregations as agg
-from . import api_client, config, rag
+from . import api_client, config, google_client, rag
 from .api_client import AlbertAPIError
+from .google_client import GoogleError
 from .observability import log_tool_call
 
 
@@ -386,6 +395,104 @@ def calculator(expression: str) -> str:
                 "Only arithmetic with numbers is allowed.")
 
 
+# --------------------------------------------------------------------------- #
+# Tool 7 — Gmail search (SENSITIVE: gated by human approval)
+# --------------------------------------------------------------------------- #
+@tool
+def search_emails(query: str = "", max_results: int = 5) -> str:
+    """Search the student's Gmail inbox and list matching messages (newest first).
+
+    Use for "any email from my professor?", "did I get the exam schedule?",
+    "unread mail about the project". ``query`` uses Gmail search syntax —
+    ``from:`` ``subject:`` ``is:unread`` ``newer_than:7d`` ``has:attachment`` —
+    and can be combined (e.g. ``from:dupont subject:exam newer_than:14d``). Leave
+    it empty for the most recent messages. Returns each message's sender, subject,
+    date, a snippet, and an id you can pass to ``read_email`` for the full text.
+    Reading email is private, so the student is asked to approve before this runs.
+    """
+    try:
+        with log_tool_call("search_emails", {"query": query, "max_results": max_results}):
+            messages = google_client.search_messages(query, max_results)
+            if not messages:
+                scope = f" matching '{query}'" if query else ""
+                return f"No emails found{scope}."
+            out = [f"{len(messages)} email(s)"
+                   + (f" matching '{query}'" if query else " (most recent)") + ":"]
+            for m in messages:
+                out.append(
+                    f"\n• From: {m['from']}\n  Subject: {m['subject']}\n"
+                    f"  Date: {m['date']}\n  Preview: {m['snippet']}\n  id: {m['id']}"
+                )
+            return "\n".join(out)
+    except GoogleError as exc:
+        return f"⚠️ Could not search your email: {exc}"
+    except Exception as exc:  # noqa: BLE001
+        return f"⚠️ Unexpected error while searching your email: {exc}"
+
+
+# --------------------------------------------------------------------------- #
+# Tool 8 — read one email in full (SENSITIVE: gated by human approval)
+# --------------------------------------------------------------------------- #
+@tool
+def read_email(message_id: str) -> str:
+    """Read the full body of ONE email, identified by the id from ``search_emails``.
+
+    Use when a snippet is not enough and the student wants the actual contents of
+    a specific message ("what exactly does that email say?"). ``message_id`` must
+    be an id returned by ``search_emails``. Returns the sender, recipient, subject,
+    date and the full (plain-text) body. Like ``search_emails`` this is private
+    and asks for the student's approval first.
+    """
+    try:
+        with log_tool_call("read_email", {"message_id": message_id}):
+            m = google_client.get_message(message_id)
+            return (
+                f"From: {m['from']}\nTo: {m['to']}\nSubject: {m['subject']}\n"
+                f"Date: {m['date']}\n\n{m['body']}"
+            )
+    except GoogleError as exc:
+        return f"⚠️ Could not read that email: {exc}"
+    except Exception as exc:  # noqa: BLE001
+        return f"⚠️ Unexpected error while reading the email: {exc}"
+
+
+# --------------------------------------------------------------------------- #
+# Tool 9 — Google Calendar lookup
+# --------------------------------------------------------------------------- #
+@tool
+def get_calendar_events(
+    start_date: str | None = None,
+    end_date: str | None = None,
+    query: str | None = None,
+    max_results: int = 10,
+) -> str:
+    """List the student's Google Calendar events in a date window.
+
+    Use for "what's on my schedule this week", "any classes tomorrow", "when is
+    my next exam". ``start_date``/``end_date`` are ISO dates ("2026-06-12") or
+    datetimes; resolve relative dates from today's date (given in your system
+    prompt). Omit them for the next week. ``query`` filters by text (e.g. "exam").
+    Returns each event's title, start, end and location.
+    """
+    try:
+        with log_tool_call("get_calendar_events",
+                           {"start_date": start_date, "end_date": end_date,
+                            "query": query}):
+            events = google_client.list_events(start_date, end_date, query, max_results)
+            if not events:
+                scope = f" matching '{query}'" if query else ""
+                return f"No calendar events found{scope} in that period."
+            out = [f"{len(events)} event(s):"]
+            for e in events:
+                loc = f" @ {e['location']}" if e["location"] else ""
+                out.append(f"• {e['start']} → {e['end']}: {e['summary']}{loc}")
+            return "\n".join(out)
+    except GoogleError as exc:
+        return f"⚠️ Could not read your calendar: {exc}"
+    except Exception as exc:  # noqa: BLE001
+        return f"⚠️ Unexpected error while reading your calendar: {exc}"
+
+
 # The agent's full toolbox, in a stable order.
 TOOLS = [
     list_my_program,
@@ -394,4 +501,12 @@ TOOLS = [
     get_grades_summary,
     search_school_documents,
     calculator,
+    search_emails,
+    read_email,
+    get_calendar_events,
 ]
+
+# Tools whose execution the graph gates behind explicit human approval, because
+# they read the student's private mailbox. The conditional edge routes to the
+# ``human_approval`` node whenever the model requests one of these.
+SENSITIVE_TOOLS = {"search_emails", "read_email"}
