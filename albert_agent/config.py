@@ -45,10 +45,25 @@ REQUEST_TIMEOUT = 20  # seconds, per HTTP call
 # --------------------------------------------------------------------------- #
 # LLM (Groq)
 # --------------------------------------------------------------------------- #
-# llama-3.3-70b-versatile is strong at routing/tool-use and supports parallel
-# tool calls; the 8b instant model is kept as a documented cheaper fallback.
+# Primary model: llama-3.3-70b-versatile is strong at routing/tool-use and
+# supports parallel tool calls.
 MODEL_NAME = os.getenv("ALBERT_AGENT_MODEL", "llama-3.3-70b-versatile")
-FALLBACK_MODEL = "llama-3.1-8b-instant"
+
+# Fallback CHAIN, tried in order when a model is rate-limited or unavailable.
+# Groq's free tier caps tokens-per-day *per model*, so one model running out does
+# not affect the others — walking this chain keeps the agent available as long as
+# any one model has quota. Ordered capability-first so quality degrades
+# gracefully. Every entry supports the LOCAL tool-calling the agent depends on;
+# `groq/compound` and `groq/compound-mini` are deliberately excluded because the
+# Groq "Supported Models" table marks them "Local Tool Use: No".
+FALLBACK_MODELS = [
+    "openai/gpt-oss-120b",                        # strong, separate quota
+    "qwen/qwen3-32b",                             # strong, parallel tools
+    "meta-llama/llama-4-scout-17b-16e-instruct",  # parallel tools
+    "openai/gpt-oss-20b",                         # smaller but capable
+    "llama-3.1-8b-instant",                       # fast/cheap last resort
+]
+
 TEMPERATURE = 0.0          # deterministic: this is an information assistant
 MAX_TOKENS = 1024          # cap each LLM turn (part of the safety harness)
 

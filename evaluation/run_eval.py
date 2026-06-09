@@ -92,7 +92,7 @@ def main() -> None:
         cases = [c for c in cases if args.tag in c.tags]
 
     app = get_agent(checkpointer=InMemorySaver())  # isolated, no on-disk state
-    print(f"Model: {config.MODEL_NAME} (fallback {config.FALLBACK_MODEL})")
+    print(f"Model: {config.MODEL_NAME} | fallback chain: {', '.join(config.FALLBACK_MODELS)}")
     print(f"Running {len(cases)} cases\n" + "=" * 72)
 
     results = []

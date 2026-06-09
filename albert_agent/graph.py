@@ -17,6 +17,7 @@ counter lives in the state and is reset by ``guard`` at the start of every turn.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from functools import lru_cache
 from typing import Annotated, Literal, TypedDict
@@ -73,14 +74,10 @@ class AgentState(TypedDict):
 # --------------------------------------------------------------------------- #
 # Model (memoised: bind the tools once per model)
 # --------------------------------------------------------------------------- #
-# Groq exception class names treated as transient -> retry on the fallback model.
-_TRANSIENT_ERRORS = {
-    "RateLimitError", "InternalServerError", "APIConnectionError",
-    "APITimeoutError", "ServiceUnavailableError",
-}
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 
-@lru_cache(maxsize=4)
+@lru_cache(maxsize=8)
 def _bound_llm(model_name: str):
     """Build a tool-bound Groq model, memoised per model name."""
     llm = ChatGroq(
@@ -97,21 +94,50 @@ def get_llm():
     return _bound_llm(config.MODEL_NAME)
 
 
-def invoke_model(messages):
-    """Call the primary model, falling back to the cheaper model on a 429/5xx.
+def _model_chain() -> list[str]:
+    """The primary model followed by the distinct fallback models, in order."""
+    chain = [config.MODEL_NAME]
+    for name in config.FALLBACK_MODELS:
+        if name not in chain:
+            chain.append(name)
+    return chain
 
-    A rate-limited or temporarily unavailable LLM is exactly the "LLM goes
-    off-rails / tool fails" case the safety harness must survive, so instead of
-    crashing the turn we retry once on ``FALLBACK_MODEL`` (a separate quota).
+
+def _clean(response):
+    """Strip <think>…</think> reasoning that some models emit into their content."""
+    content = getattr(response, "content", None)
+    if isinstance(content, str) and "<think>" in content:
+        response.content = _THINK_RE.sub("", content).strip()
+    return response
+
+
+def invoke_model(messages):
+    """Invoke the model chain, returning the first model that answers.
+
+    Groq's free tier caps tokens-per-day *per model*, so a single model can run
+    out mid-session. Keeping the agent available is exactly the failure the safety
+    harness exists for, so we walk the fallback chain: on *any* model error we log
+    it and try the next, and only raise once every model in the chain has failed
+    (the UI then shows a graceful message). The assistant therefore keeps working
+    as long as one Groq model still has quota.
     """
-    try:
-        return get_llm().invoke(messages)
-    except Exception as exc:  # noqa: BLE001
-        if (type(exc).__name__ in _TRANSIENT_ERRORS
-                and config.FALLBACK_MODEL != config.MODEL_NAME):
-            log_event("llm_fallback", to=config.FALLBACK_MODEL, error=type(exc).__name__)
-            return _bound_llm(config.FALLBACK_MODEL).invoke(messages)
-        raise
+    config.require("GROQ_API_KEY")
+    chain = _model_chain()
+    last_exc = None
+    for index, model_name in enumerate(chain):
+        try:
+            response = _bound_llm(model_name).invoke(messages)
+        except Exception as exc:  # noqa: BLE001 - try the next model, whatever broke
+            last_exc = exc
+            log_event("llm_skip", model=model_name, error=type(exc).__name__)
+            continue
+        if index > 0:
+            log_event("llm_fallback", used=model_name, primary=chain[0])
+        return _clean(response)
+    raise RuntimeError(
+        f"All {len(chain)} Groq models are unavailable "
+        f"(last error: {type(last_exc).__name__}). Please try again shortly."
+    ) from last_exc
 
 
 # --------------------------------------------------------------------------- #

@@ -17,12 +17,12 @@ a **Streamlit** chat UI.
 
 A student can ask, in French or English and in any order:
 
-- *"Quels cours est-ce que je suis ce semestre ?"*
-- *"Quelles sont les modalités d'évaluation du cours d'IA générative ?"*
-- *"Quel est mon taux de présence, et où suis-je le moins assidu ?"*
-- *"Quelle est ma moyenne par Teaching Unit ?"*
-- *"D'après mon relevé officiel, qu'ai-je validé en année 1 ?"*
-- *"Si j'ai 70 au CC, 75 au TP et 85 au projet, quelle est ma note finale ?"*
+- *"What classes am I taking this semester?"*
+- *"How is the generative AI course graded?"*
+- *"What is my attendance rate, and where am I least consistent?"*
+- *"What is my average grade per teaching unit?"*
+- *"According to my official transcript, what courses did I complete in my first year?"*
+- *"If I get a 70 on the written exam, a 75 on the practical exam, and an 85 on the project, what is my final grade?"*
 
 These questions don't map to one fixed pipeline: each needs a **different tool
 (or combination of tools)**, the right **identifiers**, and sometimes a
@@ -164,9 +164,15 @@ considered tool selection, not the full suggested list.
 - **Caching for Streamlit.** The compiled graph and the Chroma store are built
   once behind `@st.cache_resource`; structural API data (profile, course list) is
   memoised; documents are embedded once and persisted to `.chroma/`.
-- **Groq model.** `llama-3.3-70b-versatile` (strong at routing, supports parallel
-  tool calls), with automatic fallback to `llama-3.1-8b-instant` on a rate-limit
-  or transient API error.
+- **Groq model + fallback chain.** Primary `llama-3.3-70b-versatile` (strong at
+  routing, parallel tool calls). Groq's free tier caps tokens-per-day *per
+  model*, so a single model can run out mid-session; `invoke_model` therefore
+  walks an ordered fallback chain — `gpt-oss-120b` → `qwen3-32b` →
+  `llama-4-scout` → `gpt-oss-20b` → `llama-3.1-8b-instant` — trying the next
+  model on any error and only failing if *every* model is exhausted. The agent
+  stays available as long as one model has quota. `groq/compound*` are excluded
+  because they don't support local tool calling. (Reasoning tags some models emit
+  are stripped from the answer.)
 
 ---
 
@@ -192,8 +198,9 @@ show off a feature:
    always-on log is local; full prompt/token traces need LangSmith.
 5. **Safety harness** — a per-turn tool-loop budget enforced *in the conditional
    edge* (→ `fallback`), a per-call `max_tokens` cap, a graph recursion limit,
-   per-tool error handling, and the model fallback above. The budget is part of
-   the graph, not a wrapper, which is why it is testable as a routed branch.
+   per-tool error handling, and the model fallback chain above. The budget is
+   part of the graph, not a wrapper, which is why it is testable as a routed
+   branch.
 
 Human-in-the-loop and MCP were deliberately skipped: the assistant is read-only
 over the student's own data, so an approval gate would be gratuitous.
@@ -223,9 +230,9 @@ python -m evaluation.run_eval --tag rag # one category
 three routes, including a budget-capped case that correctly diverts to
 `fallback`. The recommended `llama-3.3-70b-versatile` hit its Groq free-tier
 **daily token limit** during evaluation, so the suite was run on the comparably
-capable `openai/gpt-oss-120b`; while 70b was throttled, the automatic fallback to
-`llama-3.1-8b-instant` was observed keeping the agent answering — the safety
-harness doing its job.
+capable `openai/gpt-oss-120b`; while 70b was throttled, the automatic fallback
+chain was observed keeping the agent answering — the safety harness doing its
+job.
 
 **Failure modes observed.** (1) The small `8b` fallback model sometimes emits a
 meta-comment instead of synthesising the tool results, or calls a tool twice —
@@ -239,7 +246,7 @@ answer quality for availability rather than failing the turn.
 
 ## Three example interactions (tested)
 
-**1 — Program, single tool.** *"Quels cours est-ce que je suis ce semestre ?"*
+**1 — Program, single tool.** *"What classes am I taking this semester?"*
 → routes to `list_my_program` → answers with the numbered current-term courses:
 
 ```

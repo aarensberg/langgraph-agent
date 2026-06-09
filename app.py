@@ -23,7 +23,9 @@ from langchain_core.messages import AIMessage, HumanMessage
 from albert_agent import config, rag
 from albert_agent.graph import get_agent
 
-st.set_page_config(page_title="Albert Student Assistant", page_icon="🎓", layout="centered")
+st.set_page_config(
+    page_title="Albert Student Assistant", page_icon="🎓", layout="centered"
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -98,7 +100,9 @@ def run_and_stream(user_text: str) -> tuple[str, list[str]]:
             stream_mode="updates",
         ):
             for node, update in chunk.items():
-                messages = update.get("messages", []) if isinstance(update, dict) else []
+                messages = (
+                    update.get("messages", []) if isinstance(update, dict) else []
+                )
                 if node == "agent":
                     ai = messages[-1] if messages else None
                     calls = getattr(ai, "tool_calls", []) if ai else []
@@ -149,7 +153,9 @@ for entry in st.session_state.history:
 # --------------------------------------------------------------------------- #
 # Chat input
 # --------------------------------------------------------------------------- #
-prompt = st.chat_input("e.g. What's my attendance rate, and my average per teaching unit?")
+prompt = st.chat_input(
+    "e.g. What's my attendance rate, and my average per teaching unit?"
+)
 if prompt:
     st.session_state.history.append(("user", prompt, []))
     render_message("user", prompt, [])
@@ -157,7 +163,8 @@ if prompt:
         answer, trace = run_and_stream(prompt)
     except Exception as exc:  # noqa: BLE001 - never let one bad turn break the app
         answer, trace = (
-            f"⚠️ Something went wrong while answering: {exc}", ["error"],
+            f"⚠️ Something went wrong while answering: {exc}",
+            ["error"],
         )
     st.session_state.history.append(("assistant", answer, trace))
     render_message("assistant", answer, trace)
@@ -177,16 +184,17 @@ with st.sidebar:
 
     st.markdown("### Try asking")
     for example in [
-        "Quels cours est-ce que je suis ce semestre ?",
-        "Quelles sont les modalités d'évaluation du cours d'IA générative ?",
-        "Quel est mon taux de présence, et où suis-je le moins assidu ?",
-        "Quelle est ma moyenne par Teaching Unit ?",
-        "Quelles étaient mes notes en année 1 d'après mon relevé ?",
+        "What classes am I taking this semester?",
+        "How is the generative AI course graded?",
+        "What is my attendance rate, and where am I least consistent?",
+        "What is my average score per teaching unit?",
+        "What were my grades in first grade, according to my transcript?",
     ]:
         st.markdown(f"- {example}")
 
     st.markdown("### Status")
     st.caption(f"Model: `{config.MODEL_NAME}`")
-    st.caption(f"Fallback: `{config.FALLBACK_MODEL}`")
+    st.caption(f"Fallback chain ({len(config.FALLBACK_MODELS)}): "
+               f"{', '.join(config.FALLBACK_MODELS)}")
     st.caption(f"Documents: {warm_documents()}")
     st.caption(f"Max tool loops/turn: {config.MAX_TOOL_ITERATIONS}")
